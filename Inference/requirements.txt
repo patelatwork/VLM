@@ -1,0 +1,7 @@
+torch>=2.2
+transformers>=4.45
+peft>=0.11
+accelerate>=0.30
+pillow>=10.0
+gradio>=4.44
+huggingface_hub>=0.24
