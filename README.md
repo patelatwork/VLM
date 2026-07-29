@@ -1,3 +1,37 @@
+# TinyVLM
+
+A small LLaVA-style VLM: SigLIP2 vision encoder → MLP projector → Qwen2.5-0.5B-Instruct with LoRA.
+
+```
+Model/model.py                architecture
+Model/dataset.py              conversation schema, prompt construction, collation
+Training/prepare_data.py      builds the JSONL corpora
+Training/train.py             both stages (--stage 1 | 2)
+Inference/inference.py        load + answer
+Inference/diagnose_grounding.py   is the model actually looking at the image?
+Inference/app_gradio.py       demo UI
+push_to_hub.py                upload projector + adapter
+vlm-train-v2.ipynb            Kaggle pipeline end to end
+```
+
+Quick start: open `vlm-train-v2.ipynb` on Kaggle (GPU T4 x2, Internet on, with the
+`adityajn105/flickr8k` dataset attached).
+
+**Before trusting any checkpoint, run the grounding check:**
+
+```bash
+python Inference/diagnose_grounding.py \
+    --projector_ckpt ckpt/stage2/projector.pt \
+    --lora_dir ckpt/stage2/lora_adapter \
+    --images a.jpg b.jpg c.jpg
+```
+
+Same question, several different images. If the answers are identical, the LLM is
+answering from the question prior and the projector carries no signal — that is a
+failed alignment stage, not a decoding-parameter problem.
+
+---
+
 ## Example: A Single Forward Pass Through a LLaVA-Style VLM
 
 ### Setup
@@ -104,3 +138,46 @@ So the model is only ever penalized for getting the *answer* right — it's not 
 ### Why This Works at All
 
 The key trick: the LLM was never explicitly designed to accept images. It just sees 205 vectors of dim 896 and predicts the next token, same as always. The "vision understanding" lives entirely in whether the projector has learned a mapping such that a vector representing "bicycle wheel" ends up sitting near where the token embedding for "bicycle" naturally sits in Qwen's space. Stage 1 training is literally forcing that alignment via the captioning loss.
+
+---
+
+## How the implementation differs from the walkthrough above
+
+The walkthrough is the clean mental model. Four places where the shipped code
+deliberately departs from it, each because the naive version failed in practice:
+
+**196 visual tokens → 49.** A 2×2 pixel-shuffle folds each patch neighbourhood
+into one token (the channel dim absorbs what the sequence dim gives up, so
+nothing is discarded). With a 0.5B LLM and a single-session training budget,
+sample efficiency beats spatial resolution — and it raises the ratio of
+supervised tokens to total tokens by ~4×.
+
+**Splicing → repeat-and-scatter.** Rather than inserting one `<image>` token and
+splicing embeddings around it, the placeholder is repeated 49 times in
+`input_ids` and overwritten via `masked_scatter`. Sequence length never changes,
+so `labels` and `attention_mask` line up by construction instead of by index
+arithmetic — which is where the original padding and masking bugs lived.
+
+**A new `<image>` token → Qwen's existing `<|image_pad|>`.** Adding a token
+forces `resize_token_embeddings`, which *shrinks* Qwen's embedding matrix
+(151936 rows on disk, 151666 known to the tokenizer) and makes PEFT serialise
+the whole table into the adapter — 1.1 GB instead of ~35 MB.
+
+**The projector ends in a scale-matched LayerNorm.** Raw SigLIP hidden states
+have ~104× the per-token norm of Qwen's text embeddings. Dropped in unscaled,
+the visual tokens sit far outside the manifold the LLM was trained on, and the
+projector spends its whole budget just learning to rescale. Initialising the
+LayerNorm gain to the LLM's own embedding std puts the ratio at ~1.0× from step
+zero.
+
+## Answer length is controlled by the prompt
+
+Training on VQAv2 alone teaches the model that every answer is one word — its
+targets tokenize to `['red', '<|im_end|>']`, two supervised tokens. Stage 2 mixes
+one-word VQA with multi-sentence descriptions, and VQA examples carry an explicit
+hint, so length becomes a runtime choice:
+
+```python
+answer(model, img, "What color is the bus?")                    # "The bus is red."
+answer(model, img, "What color is the bus?", short_answer=True) # "red"
+```
