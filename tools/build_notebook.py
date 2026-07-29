@@ -92,6 +92,14 @@ md("## 1. Environment")
 
 code(r"""
 !pip install -q "transformers>=4.45" "peft>=0.11" accelerate datasets huggingface_hub
+
+# Kaggle preinstalls torchao 0.10.0; current PEFT wants >0.16.0. PEFT's
+# `dispatch_torchao` runs for every Linear it wraps, and its `is_torchao_available()`
+# guard RAISES on an old version instead of returning False -- so `get_peft_model`
+# dies at stage 2 with "Found an incompatible version of torchao". Nothing here
+# quantizes, so the fix is to make the package absent: find_spec then returns None
+# and the guard returns False.
+!pip uninstall -y torchao 2>/dev/null | tail -1
 """)
 
 code(r"""
@@ -200,12 +208,17 @@ produce the same caption, stop -- Stage 2 will not rescue it.
 """)
 
 code(r"""
+# batch_size 8 x accum 4 == the same effective batch of 32, but a quarter of the
+# peak memory. A 14.5 GB T4 cannot hold micro-batch 32: Qwen's 151,936-wide
+# logits get upcast to fp32 for the loss, so logits + their gradient alone are
+# ~4 GB at that size. Raise --batch_size only if you also pass
+# --grad_checkpointing.
 !python train.py --stage 1 \
     --data /kaggle/working/data/stage1.jsonl \
     --image_root /kaggle/working/data/images \
     --output_dir /kaggle/working/ckpt/stage1 \
-    --epochs 2 --batch_size 32 --accum_steps 1 --lr 1e-3 \
-    --num_workers 4 --eval_every 500 --save_every 4000
+    --epochs 2 --batch_size 8 --accum_steps 4 --lr 1e-3 \
+    --num_workers 4 --eval_every 500 --save_every 2000
 """)
 
 md(r"""
@@ -244,14 +257,20 @@ lower LR so it is refined rather than overwritten.
 """)
 
 code(r"""
-!python train.py --stage 2 \
+# Smaller micro-batch than stage 1 despite the smaller corpus. Peak memory is
+# batch x LONGEST ROW IN THE BATCH, and the collator pads every row up to it, so
+# one multi-turn ReCap example drags all its batch-mates with it. At batch 8 /
+# max_length 1024 that lottery OOMs after ~2k batches, in lm_head, on a
+# 151,936-wide logit tensor. 4 x 640 caps the worst case at 2,560 tokens;
+# accum 4 keeps the effective batch at 16.
+!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train.py --stage 2 \
     --data /kaggle/working/data/stage2.jsonl \
     --image_root /kaggle/working/data/images \
     --projector_ckpt /kaggle/working/ckpt/stage1/projector.pt \
     --output_dir /kaggle/working/ckpt/stage2 \
-    --epochs 3 --batch_size 16 --accum_steps 1 \
+    --epochs 2 --batch_size 4 --accum_steps 4 --max_length 640 \
     --lr 2e-4 --projector_lr 2e-5 --lora_r 16 --lora_alpha 32 \
-    --num_workers 4 --eval_every 500 --save_every 4000
+    --num_workers 4 --eval_every 500 --save_every 1000
 """)
 
 md("### Grounding gate again, now with the adapter")

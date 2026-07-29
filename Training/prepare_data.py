@@ -152,21 +152,42 @@ def prepare_flickr8k(kaggle_input_dir, out_jsonl, out_image_dir, max_examples=No
 # Flickr30k (Hugging Face, images embedded in parquet)
 # --------------------------------------------------------------------------- #
 
-def prepare_flickr30k(out_jsonl, out_image_dir, max_examples=None, seed=0, captions_per_image=5):
+# `nlphuji/flickr30k` is script-based (`flickr30k.py`), and datasets>=4.0
+# refuses to run dataset scripts at all:
+#     RuntimeError: Dataset scripts are no longer supported, but found flickr30k.py
+# `lmms-lab/flickr30k` is a script-free parquet mirror of the same 31,783
+# images. Both put everything under a single split named "test"; the lmms-lab
+# copy drops the per-row `split` column, so the official-test filter below is a
+# no-op there and Stage 1 simply trains on all of Flickr30k.
+FLICKR30K_REPOS = ["lmms-lab/flickr30k", "nlphuji/flickr30k"]
+
+
+def _load_flickr30k_stream():
     from datasets import load_dataset
 
+    errors = []
+    for repo in FLICKR30K_REPOS:
+        try:
+            ds = load_dataset(repo, split="test", streaming=True)
+            print(f"flickr30k source: {repo}")
+            return ds
+        except Exception as e:  # script-based repo, gated repo, network, ...
+            errors.append(f"  {repo}: {type(e).__name__}: {e}")
+    raise RuntimeError("Could not load Flickr30k from any mirror:\n" + "\n".join(errors))
+
+
+def prepare_flickr30k(out_jsonl, out_image_dir, max_examples=None, seed=0, captions_per_image=5):
     rng = random.Random(seed)
     out_image_dir = Path(out_image_dir)
 
-    # nlphuji/flickr30k ships everything under a single split (named "test"),
-    # with a per-row `split` column carrying the real train/val/test label.
-    ds = load_dataset("nlphuji/flickr30k", split="test", streaming=True)
+    ds = _load_flickr30k_stream()
 
     records, n_img = [], 0
     for ex in ds:
         if ex.get("split") == "test":
             continue  # keep the official test images out of training
-        name = f"f30k_{ex.get('img_id', n_img)}.jpg"
+        stem = str(ex.get("img_id") or ex.get("filename") or n_img)
+        name = f"f30k_{Path(stem).stem}.jpg"
         try:
             save_resized(ex["image"], out_image_dir / name)
         except Exception:
@@ -268,6 +289,13 @@ def prepare_recap(out_jsonl, out_image_dir, max_examples=20000, max_words=140):
 # --------------------------------------------------------------------------- #
 
 def mix(inputs, out_jsonl, seed=0, caps=None):
+    missing = [p for p in inputs if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(
+            "mix inputs not found -- the corpus that produces them failed earlier:\n"
+            + "\n".join(f"  {p}" for p in missing)
+        )
+
     rng = random.Random(seed)
     all_recs = []
     for idx, path in enumerate(inputs):

@@ -38,7 +38,12 @@ import sys
 import time
 from pathlib import Path
 
-import torch
+# Must be set before the CUDA allocator initialises. Activation and logit
+# buffers here swing by ~4 GB between micro-batches; without expandable
+# segments the allocator fragments and OOMs with GBs still nominally free.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import torch  # noqa: E402
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
@@ -72,6 +77,10 @@ def parse_args():
     p.add_argument("--lora_r", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=32)
 
+    p.add_argument("--grad_checkpointing", action="store_true",
+                   help="recompute LLM activations in backward: ~40%% less activation "
+                        "memory for ~30%% less throughput. Lets you raise --batch_size "
+                        "when the OOM is activation-bound rather than logit-bound.")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--eval_every", type=int, default=500)
     p.add_argument("--save_every", type=int, default=2000)
@@ -114,6 +123,14 @@ def build_model(args):
             task_type="CAUSAL_LM",
         )
         model.llm = get_peft_model(model.llm, lora_config)
+
+    if args.grad_checkpointing:
+        # use_reentrant=False is the variant that works when the module's own
+        # parameters are frozen -- gradient still has to flow through the LLM to
+        # reach the projector, but no LLM weight requires grad in stage 1.
+        model.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.llm.config.use_cache = False
+        print("gradient checkpointing: on")
 
     return model
 
@@ -159,6 +176,10 @@ def sample_generations(model, examples, image_root, device, amp_dtype, n=2):
                 pixel_values=px,
                 max_new_tokens=64,
                 do_sample=False,
+                # --grad_checkpointing sets config.use_cache=False, which would
+                # make these sample generations quadratic. Only training needs
+                # the cache off.
+                use_cache=True,
             )
         outs.append((ex["image"], q[:60], model.tokenizer.decode(ids[0], skip_special_tokens=True)))
     model.train()

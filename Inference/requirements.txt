@@ -1,4 +1,9 @@
 torch>=2.2
+# Required, not optional: transformers resolves AutoImageProcessor to the
+# torchvision-backed *fast* variant by default, and that is what the model was
+# trained with. Dropping it (or passing use_fast=False) silently changes image
+# preprocessing between training and serving.
+torchvision
 transformers>=4.45
 peft>=0.11
 accelerate>=0.30

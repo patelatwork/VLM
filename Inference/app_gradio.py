@@ -33,6 +33,17 @@ if REPO_ID:
 else:
     projector_ckpt = os.environ.get("PROJECTOR_CKPT", "checkpoints/stage2/projector.pt")
     lora_dir = os.environ.get("LORA_DIR", "checkpoints/stage2/lora_adapter")
+    if not Path(projector_ckpt).exists():
+        # In a Space this always means HF_REPO_ID was never set, so the local
+        # branch ran and reported a training-machine path that was never going
+        # to exist. Say that, rather than raising FileNotFoundError on it.
+        raise RuntimeError(
+            f"No weights: HF_REPO_ID is unset and {projector_ckpt!r} does not exist.\n"
+            "In a Space, set the HF_REPO_ID variable (Settings > Variables and secrets) "
+            "to the repo holding projector.pt + lora_adapter/, e.g. you/tinyvlm-vqa. "
+            "`python deploy_space.py --space_id ... --model_repo ...` sets it for you.\n"
+            "Locally, set PROJECTOR_CKPT and LORA_DIR instead."
+        )
 
 model = load_model(projector_ckpt, lora_dir, DEVICE)
 

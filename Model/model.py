@@ -137,7 +137,12 @@ class TinyVLM(nn.Module):
         # materialises SigLIP's unused text tower (~450 MB) and emits confusing
         # vocab warnings from its CLIP-inherited text config.
         self.vision_encoder = _load_vision_tower(vision_model_name, dtype)
-        self.image_processor = AutoImageProcessor.from_pretrained(vision_model_name)
+        # Explicit rather than default-dependent. transformers recently flipped
+        # AutoImageProcessor to the fast (torchvision) variant, and the two
+        # resize/normalise slightly differently. Whichever one trained the
+        # checkpoint has to be the one that serves it, so pin it here instead of
+        # inheriting whatever the installed version happens to prefer.
+        self.image_processor = AutoImageProcessor.from_pretrained(vision_model_name, use_fast=True)
         vision_cfg = self.vision_encoder.config
         vision_dim = vision_cfg.hidden_size
         _assert_vision_tower_loaded(self.vision_encoder, vision_model_name)
